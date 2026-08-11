@@ -1,9 +1,10 @@
 /*
  * FaceDetection.ino  —  MTCNN face detection on ESP32-P4
  *
- * Captures 96×96 RGB frames and runs the 3-stage MTCNN cascade
- * (P-Net → R-Net → O-Net) to detect face bounding boxes.
- * Outputs box coordinates and timing to the serial console.
+ * Captures 96×96 RGB frames and runs a 2-stage cascade
+ * (P-Net → R-Net) to detect face bounding boxes.
+ * O-Net removed — it only adds facial landmarks (not needed here)
+ * and costs ~70% of total inference time.
  *
  * Camera selection: see image_provider.h — change CAMERA_TYPE to
  * switch between IMX219 and OV5647.
@@ -13,12 +14,12 @@
 #include "model_settings.h"
 #include "mtcnn_utils.h"
 
-// Include the 5 MTCNN model data arrays.
+// Include MTCNN model data arrays (4 models: 3 P-Net scales + R-Net).
+// O-Net omitted — we only need face location, not facial landmarks.
 #include "models/pnet_1.c"
 #include "models/pnet_2.c"
 #include "models/pnet_3.c"
 #include "models/rnet.c"
-#include "models/onet.c"
 
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -38,12 +39,12 @@
 
 static constexpr int kDebugBaud = 921600;
 
-// Tensor arena: shared by all 5 interpreters (sequential use is safe).
-// 200 KB should be ample; the reference uses ~149 KB on S3.
-static constexpr int kTensorArenaSize = 200 * 1024;
+// Tensor arena: shared by 4 interpreters (3 P-Net + R-Net, sequential use).
+// O-Net was the biggest arena consumer; without it 120 KB is ample.
+static constexpr int kTensorArenaSize = 120 * 1024;
 
-// Inference task stack/key
-static constexpr uint32_t kInferenceTaskStackBytes = 48 * 1024;
+// Inference task stack (less work without O-Net)
+static constexpr uint32_t kInferenceTaskStackBytes = 32 * 1024;
 
 /* ── Globals ───────────────────────────────────────────────────────── */
 
@@ -54,33 +55,27 @@ tflite::MicroInterpreter *pnet_1_interpreter = nullptr;
 tflite::MicroInterpreter *pnet_2_interpreter = nullptr;
 tflite::MicroInterpreter *pnet_3_interpreter = nullptr;
 tflite::MicroInterpreter *rnet_interpreter  = nullptr;
-tflite::MicroInterpreter *onet_interpreter  = nullptr;
 }  // namespace
 
 /* ── TFLite initialisation ─────────────────────────────────────────── */
 
 static bool tflm_init() {
-    // Map models
     const tflite::Model *pnet_1_model = tflite::GetModel(pnet_1_model_data);
     const tflite::Model *pnet_2_model = tflite::GetModel(pnet_2_model_data);
     const tflite::Model *pnet_3_model = tflite::GetModel(pnet_3_model_data);
     const tflite::Model *rnet_model    = tflite::GetModel(rnet_model_data);
-    const tflite::Model *onet_model    = tflite::GetModel(onet_model_data);
 
     if (pnet_1_model->version() != TFLITE_SCHEMA_VERSION ||
         pnet_2_model->version() != TFLITE_SCHEMA_VERSION ||
         pnet_3_model->version() != TFLITE_SCHEMA_VERSION ||
-        rnet_model->version()    != TFLITE_SCHEMA_VERSION ||
-        onet_model->version()    != TFLITE_SCHEMA_VERSION) {
+        rnet_model->version()    != TFLITE_SCHEMA_VERSION) {
         Serial.println("ERROR: model schema version mismatch");
         return false;
     }
 
-    // Allocate tensor arena from PSRAM (16-byte aligned)
     tensor_arena = (uint8_t *)heap_caps_aligned_alloc(
         16, kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (tensor_arena == nullptr) {
-        // Fallback to internal SRAM
         tensor_arena = (uint8_t *)heap_caps_aligned_alloc(
             16, kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
@@ -90,7 +85,7 @@ static bool tflm_init() {
     }
     Serial.printf("Tensor arena: %d bytes allocated\n", kTensorArenaSize);
 
-    // Op resolver: all 10 ops needed by MTCNN
+    // Op resolver: 10 ops (PReLU + Dequantize needed by all MTCNN models)
     static tflite::MicroMutableOpResolver<10> micro_op_resolver;
     micro_op_resolver.AddAveragePool2D();
     micro_op_resolver.AddConv2D();
@@ -103,7 +98,7 @@ static bool tflm_init() {
     micro_op_resolver.AddReshape();
     micro_op_resolver.AddSoftmax();
 
-    // Build 5 interpreters sharing the same arena (sequential use)
+    // Build 4 interpreters sharing the same arena (sequential use is safe)
     static tflite::MicroInterpreter static_pnet_1(
         pnet_1_model, micro_op_resolver, tensor_arena, kTensorArenaSize);
     static tflite::MicroInterpreter static_pnet_2(
@@ -112,35 +107,23 @@ static bool tflm_init() {
         pnet_3_model, micro_op_resolver, tensor_arena, kTensorArenaSize);
     static tflite::MicroInterpreter static_rnet(
         rnet_model, micro_op_resolver, tensor_arena, kTensorArenaSize);
-    static tflite::MicroInterpreter static_onet(
-        onet_model, micro_op_resolver, tensor_arena, kTensorArenaSize);
 
     pnet_1_interpreter = &static_pnet_1;
     pnet_2_interpreter = &static_pnet_2;
     pnet_3_interpreter = &static_pnet_3;
     rnet_interpreter   = &static_rnet;
-    onet_interpreter   = &static_onet;
 
-    // Allocate tensors for each model
     if (pnet_1_interpreter->AllocateTensors() != kTfLiteOk) {
-        Serial.println("ERROR: pnet_1 AllocateTensors failed");
-        return false;
+        Serial.println("ERROR: pnet_1 AllocateTensors failed"); return false;
     }
     if (pnet_2_interpreter->AllocateTensors() != kTfLiteOk) {
-        Serial.println("ERROR: pnet_2 AllocateTensors failed");
-        return false;
+        Serial.println("ERROR: pnet_2 AllocateTensors failed"); return false;
     }
     if (pnet_3_interpreter->AllocateTensors() != kTfLiteOk) {
-        Serial.println("ERROR: pnet_3 AllocateTensors failed");
-        return false;
+        Serial.println("ERROR: pnet_3 AllocateTensors failed"); return false;
     }
     if (rnet_interpreter->AllocateTensors() != kTfLiteOk) {
-        Serial.println("ERROR: rnet AllocateTensors failed");
-        return false;
-    }
-    if (onet_interpreter->AllocateTensors() != kTfLiteOk) {
-        Serial.println("ERROR: onet AllocateTensors failed");
-        return false;
+        Serial.println("ERROR: rnet AllocateTensors failed"); return false;
     }
 
     return true;
@@ -152,7 +135,6 @@ static void inference_task(void *arg) {
     (void)arg;
     uint16_t frame_id = 0;
 
-    // Buffer for the latest RGB frame (96×96×3)
     uint8_t *rgb_buf = (uint8_t *)malloc(kMaxImageSize);
     if (!rgb_buf) {
         Serial.println("ERROR: failed to allocate RGB buffer");
@@ -163,31 +145,32 @@ static void inference_task(void *arg) {
     for (;;) {
         uint64_t t_loop_start = esp_timer_get_time();
 
-        // ── 1. Capture frame ──
+        // ── 1. Capture frame (200 ms timeout) ──
         bool updated = false;
         for (int tries = 0; tries < 100; tries++) {
-            if (CameraUpdate()) {
-                updated = true;
-                break;
-            }
+            if (CameraUpdate()) { updated = true; break; }
             delayMicroseconds(2000);
         }
-        if (!updated) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
+        if (!updated) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
 
         const uint8_t *cam_rgb = CameraGetRgb();
-        if (!cam_rgb) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-        // Copy to local buffer (camera buffer may be overwritten on next update)
+        if (!cam_rgb) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
         memcpy(rgb_buf, cam_rgb, kMaxImageSize);
-
         frame_id++;
 
-        // ── 2. P-Net stage (3 scales) ──
+        // ── 2. P-Net: fast full-image scan at 3 scales ──
+        //
+        // P-Net is a fully-convolutional 12×12 classifier.  It slides over
+        // the image and scores every 12×12 window.  Three image scales
+        // detect faces of different sizes:
+        //   scale 0.333 → detects faces ~36 px and larger
+        //   scale 0.250 → detects faces ~48 px and larger
+        //   scale 0.125 → detects faces filling most of the 96×96 frame
+        //
+        // Threshold PNET_THRESHOLD (0.5): windows scored below 0.5 are
+        // dropped immediately.  Lower → more candidates (slower but fewer
+        // missed faces).  Higher → fewer candidates (faster but may miss
+        // faces in poor lighting).
         uint64_t t_pnet_start = esp_timer_get_time();
 
         candidate_windows_t pnet_candidates;
@@ -199,6 +182,10 @@ static void inference_task(void *arg) {
         run_pnet(&pnet_candidates, pnet_3_interpreter, rgb_buf, IMG_W, IMG_H, PNET_3_SCALE);
 
         int pnet_raw_count = pnet_candidates.len;
+
+        // NMS_THRESHOLD (0.35): overlapping boxes with IoU > 35% are merged.
+        // Lower → more aggressive merging (fewer boxes per face).
+        // Higher → looser merging (may keep duplicate boxes on the same face).
         nms(&pnet_candidates, NMS_THRESHOLD, IOU_MODE);
 
         bboxes_t *pnet_bboxes = nullptr;
@@ -212,7 +199,18 @@ static void inference_task(void *arg) {
             correct_boxes(pnet_bboxes, IMG_W, IMG_H);
         }
 
-        // ── 3. R-Net stage ──
+        // ── 3. R-Net: refine each candidate ──
+        //
+        // R-Net is a 24×24 CNN with a fully-connected layer (not FCN).
+        // It takes each P-Net candidate, crops that region from the
+        // original image, resizes to 24×24, and classifies it again.
+        // This is much more accurate than P-Net because:
+        //   - Higher input resolution (24×24 vs 12×12)
+        //   - Dense layers can see the whole face at once
+        //
+        // Threshold RNET_THRESHOLD (0.7): windows scored below 0.7 are
+        // dropped.  This is stricter than P-Net because R-Net sees fewer
+        // windows so it can afford to be more discriminating.
         uint64_t t_rnet_start = esp_timer_get_time();
 
         candidate_windows_t rnet_candidates;
@@ -224,63 +222,38 @@ static void inference_task(void *arg) {
         }
         nms(&rnet_candidates, NMS_THRESHOLD, IOU_MODE);
 
-        bboxes_t *rnet_bboxes = nullptr;
-        get_calibrated_boxes(&rnet_bboxes, &rnet_candidates);
+        bboxes_t *final_bboxes = nullptr;
+        get_calibrated_boxes(&final_bboxes, &rnet_candidates);
         if (rnet_candidates.candidate_window) free(rnet_candidates.candidate_window);
         if (pnet_bboxes) { free(pnet_bboxes->bbox); free(pnet_bboxes); }
 
         uint32_t rnet_time_us = (uint32_t)(esp_timer_get_time() - t_rnet_start);
 
-        if (rnet_bboxes) {
-            square_boxes(rnet_bboxes);
-            correct_boxes(rnet_bboxes, IMG_W, IMG_H);
-        }
-
-        // ── 4. O-Net stage ──
-        uint64_t t_onet_start = esp_timer_get_time();
-
-        candidate_windows_t onet_candidates;
-        onet_candidates.candidate_window = nullptr;
-        onet_candidates.len = 0;
-
-        if (rnet_bboxes && rnet_bboxes->len > 0) {
-            run_onet(&onet_candidates, onet_interpreter, rgb_buf, IMG_W, IMG_H, rnet_bboxes);
-        }
-        nms(&onet_candidates, NMS_THRESHOLD, IOU_MODE);
-
-        bboxes_t *onet_bboxes = nullptr;
-        get_calibrated_boxes(&onet_bboxes, &onet_candidates);
-        if (onet_candidates.candidate_window) free(onet_candidates.candidate_window);
-        if (rnet_bboxes) { free(rnet_bboxes->bbox); free(rnet_bboxes); }
-
-        uint32_t onet_time_us = (uint32_t)(esp_timer_get_time() - t_onet_start);
-
-        if (onet_bboxes) {
-            square_boxes(onet_bboxes);
-            correct_boxes(onet_bboxes, IMG_W, IMG_H);
+        if (final_bboxes) {
+            square_boxes(final_bboxes);
+            correct_boxes(final_bboxes, IMG_W, IMG_H);
         }
 
         uint32_t total_ms = (uint32_t)((esp_timer_get_time() - t_loop_start) / 1000);
 
-        // ── 5. Print results ──
-        int num_faces = (onet_bboxes) ? onet_bboxes->len : 0;
-        Serial.printf("[frame %u] MTCNN: %d faces | P=%lums R=%lums O=%lums total=%lums | raw_cands=%d\n",
+        // ── 4. Print results ──
+        int num_faces = (final_bboxes) ? final_bboxes->len : 0;
+        Serial.printf("[frame %u] %d faces | P=%lums R=%lums total=%lums | P-Net raw=%d\n",
                       frame_id, num_faces,
                       (unsigned long)pnet_time_us / 1000,
                       (unsigned long)rnet_time_us / 1000,
-                      (unsigned long)onet_time_us / 1000,
                       (unsigned long)total_ms,
                       pnet_raw_count);
 
-        if (onet_bboxes) {
+        if (final_bboxes) {
             for (int f = 0; f < num_faces; f++) {
                 Serial.printf("  face[%d]: (%.0f, %.0f) - (%.0f, %.0f)\n",
                               f,
-                              onet_bboxes->bbox[f].x1, onet_bboxes->bbox[f].y1,
-                              onet_bboxes->bbox[f].x2, onet_bboxes->bbox[f].y2);
+                              final_bboxes->bbox[f].x1, final_bboxes->bbox[f].y1,
+                              final_bboxes->bbox[f].x2, final_bboxes->bbox[f].y2);
             }
-            free(onet_bboxes->bbox);
-            free(onet_bboxes);
+            free(final_bboxes->bbox);
+            free(final_bboxes);
         }
 
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -292,9 +265,8 @@ static void inference_task(void *arg) {
 void setup() {
     Serial.begin(kDebugBaud);
     delay(100);
-    Serial.println("\n=== FaceDetection (MTCNN on ESP32-P4) ===");
+    Serial.println("\n=== FaceDetection (MTCNN P+R, no O-Net) ===");
 
-    // Camera
     Serial.printf("Camera: %s ... ", CameraGetName());
     if (!CameraBegin()) {
         Serial.println("FAILED");
@@ -302,7 +274,6 @@ void setup() {
     }
     Serial.println("OK");
 
-    // TFLite
     Serial.print("TFLite: ");
     if (!tflm_init()) {
         Serial.println("FAILED");
@@ -310,23 +281,17 @@ void setup() {
     }
     Serial.println("OK");
 
-    // Model diagnostics
+    // Diagnostics: show P-Net tensor shapes
     {
         TfLiteTensor *inp = pnet_1_interpreter->input(0);
         Serial.printf("P-Net input:  %dx%dx%d type=%d\n",
                       inp->dims->data[1], inp->dims->data[2], inp->dims->data[3], inp->type);
-        TfLiteTensor *out0 = pnet_1_interpreter->output(0);
-        TfLiteTensor *out1 = pnet_1_interpreter->output(1);
-        Serial.printf("P-Net output: [0]=%dx%dx%d [1]=%dx%dx%d\n",
-                      out0->dims->data[1], out0->dims->data[2], out0->dims->data[3],
-                      out1->dims->data[1], out1->dims->data[2], out1->dims->data[3]);
     }
 
 #if defined(ESP_NN)
     Serial.println("ESP-NN: ENABLED");
 #endif
 
-    // Launch inference task on Core 1
     xTaskCreatePinnedToCore(
         inference_task, "mtcnn",
         kInferenceTaskStackBytes, nullptr,
